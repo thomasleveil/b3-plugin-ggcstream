@@ -35,6 +35,9 @@ Changelog
 2011-04-27 - 0.1 
 * first release. cod4 support
 
+2011-04-29 - 0.2
+* add support for frostbite games bfbc2 and moh (tested)
+* add suuport for games cod, cod2, cod5, et and etpro (untested)
 
 
 Support
