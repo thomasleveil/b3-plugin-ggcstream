@@ -23,17 +23,22 @@
 # 2011-04-29 - 0.2
 # * add support for frostbite games bfbc2 and moh (tested)
 # * add suuport for games cod, cod2, cod5, et and etpro (untested)
-
-
-__version__ = '0.2'
-__author__ = 'Courgette'
-
-
-import time, threading
-import b3.plugin
 from b3.events import EVT_UNKNOWN
+import StringIO
+import b3.plugin
+import gzip
+from socket import inet_aton
+from struct import unpack
+import threading
+import time
+import urllib2
+from hashlib import sha1
+import uuid
+import json
+from datetime import datetime
 
-
+__version__ = '1.0'
+__author__ = 'Courgette'
 
 
 SUPPORTED_PARSERS = {
@@ -48,6 +53,10 @@ SUPPORTED_PARSERS = {
 
 FROSTBITE_GAMES = ('bfbc2', 'moh')
 
+USER_AGENT =  "B3 GGC STREAM plugin/%s" % __version__
+GGCSTREAM_API_ID = "2"
+GGCSTREAM_API_KEY = "6b3e20e3affa3978106bfe36ba9b332877599793"
+
 class UnsupportedGameError(Exception):
     pass
 
@@ -56,6 +65,8 @@ class GgcstreamPlugin(b3.plugin.Plugin):
     requiresConfigFile = False
     _adminPlugin = None
     _frostbite_async_pb_msg = []
+    remote_lastmodified = remote_etag = None
+    _rconMethod = None
 
     def onStartup(self):
         if self.console.gameName not in SUPPORTED_PARSERS:
@@ -77,7 +88,7 @@ class GgcstreamPlugin(b3.plugin.Plugin):
 
         self._adminPlugin.registerCommand(self, "ggcstream", 100, self.cmd_ggcstream)
         
-        threading.Timer(10.0, self._install_GGCStream).start()
+        threading.Timer(10.0, self._check_if_installed).start()
 
         self.registerEvent(EVT_UNKNOWN)
 
@@ -93,16 +104,38 @@ class GgcstreamPlugin(b3.plugin.Plugin):
 
     def cmd_ggcstream(self, data=None, client=None, cmd=None):
         """\
-        install the GGC Stream service
+        check if the GGC Stream service is correctly setup
         """
+        jsondata = self._queryGGCStreamService(self.console._publicIp, self.console._port)
+        self.debug("%s:%s -> %r",self.console._publicIp, self.console._port, jsondata)
+        if jsondata and not 'error' in jsondata:
+            client.message("GGC Stream correctly set up")
+            for k, v in jsondata.iteritems():
+                if k == 'heartbeat':
+                    client.message("Last heartbeat sent on %s" % datetime.fromtimestamp(jsondata['heartbeat']).strftime('%Y-%m-%d %H:%M:%S'))
+                else:
+                    client.message("%s: %s" % (k, v))
+        else:
+            try:
+                self._install_GGCStream(client=client)
+                client.message("GGC Stream setup on this server")
+            except UnsupportedGameError:
+                client.message("this game is not supported")
+
+    def _check_if_installed(self):
+        jsondata = self._queryGGCStreamService(self.console._publicIp, self.console._port)
+        self.debug("%s:%s -> %r",self.console._publicIp, self.console._port, jsondata)
         try:
-            self._install_GGCStream(client=client)
-            client.message("GGC Stream setup on this server")
-        except UnsupportedGameError:
-            client.message("this game is not supported")
-
-
+            assert 'error' not in jsondata
+            assert jsondata['registered'] == 1
+            assert type(jsondata['server_id']) == int
+            assert jsondata['server_id'] > 0
+        except (AssertionError, KeyError), err:
+            self.debug(repr(err))
+            self._install_GGCStream()
+            
     def _install_GGCStream(self, client=None):
+        if client: client.message("Setting up GGC Stream...")
         try:
             self._do_uconadd(gamecode=SUPPORTED_PARSERS[self.console.gameName], client=client)
         except KeyError, e:
@@ -112,7 +145,7 @@ class GgcstreamPlugin(b3.plugin.Plugin):
     def _do_uconadd(self, gamecode=None, client=None):
         # test presence of pbucon.use
         data = self._rconMethod("pb_sv_uconadd")
-        if 'pbucon.use' in data:
+        if data and 'pbucon.use' in data:
             # no pbucon.use file : we need to create it and restart pb
             if client: client.message("creating pbucon.use file")
             self.info(self._rconMethod("pb_sv_writecfg pbucon.use"))
@@ -147,19 +180,75 @@ class GgcstreamPlugin(b3.plugin.Plugin):
         self._frostbite_async_pb_msg.append(data)
 
 
+    def _queryUrl(self, url):
+        self.info("querying %s" % url)
+        try:
+            req = urllib2.Request(url, None)
+            req.add_header('User-Agent', USER_AGENT)
+            req.add_header('Accept-encoding', 'gzip')
+            opener = urllib2.build_opener()
+            #self.debug('headers : %r', req.headers)
+            webFile =  opener.open(req)
+            data = webFile.read()
+            webFile.close()
+            if webFile.headers.get('content-encoding', '') == 'gzip':
+                data = StringIO.StringIO(data)
+                gzipper = gzip.GzipFile(fileobj=data)
+                data = gzipper.read()
+            self.remote_lastmodified = webFile.headers.get('Last-Modified') 
+            self.remote_etag = webFile.headers.get('ETag') 
+            #self.debug('received headers : %s', webFile.info())
+            #self.debug("received %s bytes", len(data))
+            return data
+        except urllib2.URLError, err:
+            self.remote_etag = self.remote_lastmodified = None
+            return "%s"%err
+        except IOError, e:
+            self.remote_etag = self.remote_lastmodified = None
+            if hasattr(e, 'reason'):
+                return "%s" % e.reason
+            elif hasattr(e, 'code'):
+                return "error code: %s" % e.code
+            self.debug("%s"%e)
+            return "%s"%e
+
+    def _queryGGCStreamService(self, ip, port):
+        myUuid = uuid.uuid4()
+        hashedkey = sha1("%s%s" % (GGCSTREAM_API_KEY, myUuid)).hexdigest() 
+        url = "http://api.ggc-stream.com/public/server/heartbeat-ipport/ip/%(ip)s/port/%(port)s/key/%(api_id)s_%(hashed_key)s_%(uuid)s" % {
+                            'ip': unpack('!L',inet_aton(ip))[0], 
+                            'port': port,
+                            'api_id': GGCSTREAM_API_ID,
+                            'hashed_key': hashedkey,
+                            'uuid': myUuid
+                            }
+        rawdata = self._queryUrl(url)
+        try:
+            jsondata = json.loads(rawdata)
+        except ValueError:
+            jsondata = {'error': rawdata}
+        return jsondata
 
 if __name__ == '__main__':
 
     from b3.fake import fakeConsole, superadmin
 
+    fakeConsole.gameName = 'cod4'
+    p = GgcstreamPlugin(fakeConsole)
+    p.onStartup()
+    
     def testCommand():
-        p = GgcstreamPlugin(fakeConsole)
-        p.onStartup()
         superadmin.connects(0)
         superadmin.says('!ggcstream')
 
-    fakeConsole.gameName = 'cod4'
-    
-    testCommand()
-    
-    time.sleep(60)
+    def testQuery(ip, port):
+        print('_'*20)
+        print("%s:%s" % (ip, port))
+        jsondata = p._queryGGCStreamService(ip, port)
+        print(jsondata)
+        if 'heartbeat' in jsondata:
+            print(time.time() - jsondata['heartbeat'])
+
+    #testCommand()
+    #testQuery("212.7.205.31", 19567)
+    time.sleep(30)
