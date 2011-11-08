@@ -45,7 +45,14 @@ Changelog
 * the !ggcstream commands now ask the GGC server if our server is correctly
   streaming
 
+2011-10-24 - 1.1
+* Add support for Battlefield 3
+* GGC Stream installation is now run in a thread so it does not block B3
+* Makes sure only one installation occurs at onceSupport
 
-Support
+
+Support 
 -------
+
+http://forum.bigbrotherbot.net/plugins-by-courgette/ggc-stream-plugin/
 

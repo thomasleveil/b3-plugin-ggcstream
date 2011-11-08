@@ -23,13 +23,22 @@
 # 2011-04-29 - 0.2
 # * add support for frostbite games bfbc2 and moh (tested)
 # * add suuport for games cod, cod2, cod5, et and etpro (untested)
+# 2011-06-04 - 1.0
+# * B3 will only install the streaming service if GGC Stream reports an error.
+# * the !ggcstream commands now ask the GGC server if our server is correctly
+#   streaming
+# 2011-10-24 - 1.1
+# * Add support for Battlefield 3
+# * GGC Stream installation is now run in a thread so it does not block B3
+# * Makes sure only one installation occurs at once
+
 from b3.events import EVT_UNKNOWN
 import StringIO
 import b3.plugin
 import gzip
 from socket import inet_aton
 from struct import unpack
-import threading
+from threading import Timer, Thread, Lock
 import time
 import urllib2
 from hashlib import sha1
@@ -37,11 +46,12 @@ import uuid
 import json
 from datetime import datetime
 
-__version__ = '1.0'
+__version__ = '1.1'
 __author__ = 'Courgette'
 
 
 SUPPORTED_PARSERS = {
+                     'bf3': 'bf3',
                      'bfbc2': 'bc2',
                      'moh': 'moh',
                      'cod': 'cod',
@@ -51,7 +61,7 @@ SUPPORTED_PARSERS = {
                      'et': 'et',
                      'etpro': 'et'}
 
-FROSTBITE_GAMES = ('bfbc2', 'moh')
+FROSTBITE_GAMES = ('bfbc2', 'moh', 'bf3')
 
 USER_AGENT =  "B3 GGC STREAM plugin/%s" % __version__
 GGCSTREAM_API_ID = "2"
@@ -67,6 +77,7 @@ class GgcstreamPlugin(b3.plugin.Plugin):
     _frostbite_async_pb_msg = []
     remote_lastmodified = remote_etag = None
     _rconMethod = None
+    _installing_lock = Lock()
 
     def onStartup(self):
         if self.console.gameName not in SUPPORTED_PARSERS:
@@ -88,7 +99,7 @@ class GgcstreamPlugin(b3.plugin.Plugin):
 
         self._adminPlugin.registerCommand(self, "ggcstream", 100, self.cmd_ggcstream)
         
-        threading.Timer(10.0, self._check_if_installed).start()
+        Timer(10.0, self._check_if_installed).start()
 
         self.registerEvent(EVT_UNKNOWN)
 
@@ -135,31 +146,37 @@ class GgcstreamPlugin(b3.plugin.Plugin):
             self._install_GGCStream()
             
     def _install_GGCStream(self, client=None):
-        if client: client.message("Setting up GGC Stream...")
         try:
-            self._do_uconadd(gamecode=SUPPORTED_PARSERS[self.console.gameName], client=client)
+            t = Thread(target=self._do_uconadd, kwargs={'gamecode':SUPPORTED_PARSERS[self.console.gameName], 'client':client}, name="GGCstream:_do_uconadd")
+            t.daemon = True
+            t.start()
         except KeyError, e:
             raise UnsupportedGameError(e)
 
-
     def _do_uconadd(self, gamecode=None, client=None):
-        # test presence of pbucon.use
-        data = self._rconMethod("pb_sv_uconadd")
-        if data and 'pbucon.use' in data:
-            # no pbucon.use file : we need to create it and restart pb
-            if client: client.message("creating pbucon.use file")
-            self.info(self._rconMethod("pb_sv_writecfg pbucon.use"))
-            self.info(self._rconMethod("pb_sv_restart"))
-            if client: client.message("restarting punkbuster, please wait...") 
-            time.sleep(20)
-        if client: client.message("adding GGC Stream to punkbuster config")
-        self.info(self._rconMethod("pb_sv_USessionLimit 9"))
-        self.info(self._rconMethod("pb_sv_uconadd 1 85.214.107.154 ggc_85.214.107.154 %s" % gamecode))
-        self.info(self._rconMethod("pb_sv_uconadd 1 85.214.107.155 ggc_85.214.107.155 %s" % gamecode))
-        self.info(self._rconMethod("pb_sv_uconadd 1 85.214.107.156 ggc_85.214.107.156 %s" % gamecode))
-        if client: client.message("saving punkbuster config")
-        self.info(self._rconMethod("pb_sv_writecfg"))
-
+        if not self._installing_lock.acquire(False):
+            if client: client.message("already setting up GGC Stream. Try later")
+        else:
+            if client: client.message("Setting up GGC Stream...")
+            try:
+                # test presence of pbucon.use
+                data = self._rconMethod("pb_sv_uconadd")
+                if data and 'pbucon.use' in data:
+                    # no pbucon.use file : we need to create it and restart pb
+                    if client: client.message("creating pbucon.use file")
+                    self.info(self._rconMethod("pb_sv_writecfg pbucon.use"))
+                    self.info(self._rconMethod("pb_sv_restart"))
+                    if client: client.message("restarting punkbuster, please wait...") 
+                    time.sleep(20)
+                if client: client.message("adding GGC Stream to punkbuster config")
+                self.info(self._rconMethod("pb_sv_USessionLimit 9"))
+                self.info(self._rconMethod("pb_sv_uconadd 1 85.214.107.154 ggc_85.214.107.154 %s" % gamecode))
+                self.info(self._rconMethod("pb_sv_uconadd 1 85.214.107.155 ggc_85.214.107.155 %s" % gamecode))
+                self.info(self._rconMethod("pb_sv_uconadd 1 85.214.107.156 ggc_85.214.107.156 %s" % gamecode))
+                if client: client.message("saving punkbuster config")
+                self.info(self._rconMethod("pb_sv_writecfg"))
+            finally:
+                self._installing_lock.release()
 
     def _frostbitePbCmd(self, command):
         """ send a punkbuster command and wait for the response """
@@ -171,7 +188,7 @@ class GgcstreamPlugin(b3.plugin.Plugin):
                 msg = self._frostbite_async_pb_msg.pop()
                 return msg
             except IndexError:
-                time.sleep(.2)
+                time.sleep(.1)
         return None
 
 
@@ -246,9 +263,9 @@ if __name__ == '__main__':
         print("%s:%s" % (ip, port))
         jsondata = p._queryGGCStreamService(ip, port)
         print(jsondata)
-        if 'heartbeat' in jsondata:
+        if 'heartbeat' in jsondata and jsondata['heartbeat']:
             print(time.time() - jsondata['heartbeat'])
 
     #testCommand()
-    #testQuery("212.7.205.31", 19567)
+    testQuery("213.163.68.23", 25700)
     time.sleep(30)
